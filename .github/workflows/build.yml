@@ -19,16 +19,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt update
-          sudo apt install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool pkg-config zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
+          sudo apt install -y git zip unzip openjdk-17-jdk python3-pip autoconf libtool libtool-bin pkg-config libltdl-dev zlib1g-dev libncurses5-dev libncursesw5-dev cmake libffi-dev libssl-dev
 
       - name: Install buildozer
         run: pip install buildozer cython
-
-      - name: Pre-accept Android SDK licenses
-        run: |
-          yes | pip install --upgrade buildozer
-          mkdir -p ~/.android
-          touch ~/.android/repositories.cfg
 
       - name: Build APK
         run: |
