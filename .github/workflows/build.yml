@@ -24,8 +24,15 @@ jobs:
       - name: Install buildozer
         run: pip install buildozer cython
 
+      - name: Pre-accept Android SDK licenses
+        run: |
+          yes | pip install --upgrade buildozer
+          mkdir -p ~/.android
+          touch ~/.android/repositories.cfg
+
       - name: Build APK
-        run: buildozer android debug
+        run: |
+          yes | buildozer android debug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
