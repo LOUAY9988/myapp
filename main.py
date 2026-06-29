@@ -3,6 +3,7 @@ import json
 import requests
 import threading
 from functools import partial
+from datetime import datetime
 
 from kivy.clock import Clock
 from kivy.metrics import dp
@@ -22,7 +23,7 @@ from kivymd.uix.dialog import MDDialog
 HISTORY_FILE = "chat_history.json"
 CONFIG_FILE = "config.json"
 
-# Gemini API endpoint (key will be read from config at runtime)
+# Gemini API endpoint (key will be read from config at runtime or environment)
 API_ENDPOINT_TEMPLATE = (
     "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={}"
 )
@@ -47,13 +48,18 @@ def save_history(history):
 
 
 def load_config():
+    cfg = {}
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                cfg = json.load(f)
         except Exception:
-            return {}
-    return {}
+            cfg = {}
+    # allow API key from environment as fallback
+    env_key = os.environ.get("API_KEY")
+    if env_key and not cfg.get("API_KEY"):
+        cfg["API_KEY"] = env_key
+    return cfg
 
 
 def save_config(cfg):
@@ -81,6 +87,10 @@ class ChatScreen(BoxLayout):
         self.scroll.add_widget(self.chat_box)
         self.add_widget(self.scroll)
 
+        # Typing indicator (hidden by default)
+        self.typing_label = MDLabel(text="", size_hint=(1, None), height=dp(24), halign="center", theme_text_color="Secondary")
+        self.add_widget(self.typing_label)
+
         # Input row
         input_row = BoxLayout(size_hint=(1, None), height=dp(64), padding=[dp(8), dp(8), dp(8), dp(8)])
         self.text_input = MDTextField(hint_text="اكتب رسالتك...", size_hint=(0.8, 1), multiline=False)
@@ -95,37 +105,57 @@ class ChatScreen(BoxLayout):
         self.history = load_history()
         self.config = load_config()
         self._dialog = None
+        self._is_typing = False
 
         # Add existing messages
         for msg in self.history:
-            self.add_bubble(msg.get("role", "model"), msg.get("text", ""))
+            self.add_bubble(msg.get("role", "model"), msg.get("text", ""), msg.get("time"))
 
-    def add_bubble(self, role, text):
+    def add_bubble(self, role, text, when=None):
         # role: 'user' or 'model'
         align_right = role == "user"
         card = MDCard(size_hint=(None, None), padding=dp(8), radius=[dp(12)], elevation=2)
         # Width: adapt to Window width (max 80% of width)
         max_w = Window.width * 0.8
-        label = MDLabel(text=text, halign="right" if align_right else "left", size_hint=(None, None), theme_text_color="Primary")
-        # measure label
-        label.text_size = (max_w - dp(24), None)
-        label.texture_update()
-        label_size = (min(max_w, label.texture_size[0]), label.texture_size[1])
-        label.size = (label_size[0], label_size[1])
-        card.size = (label.size[0] + dp(24), label.size[1] + dp(16))
+        # Main text label
+        main_label = MDLabel(text=text, halign="right" if align_right else "left", size_hint=(None, None), theme_text_color="Primary")
+        main_label.text_size = (max_w - dp(24), None)
+        main_label.texture_update()
+        main_label.size = (min(max_w, main_label.texture_size[0]), main_label.texture_size[1])
+
+        # Timestamp
+        if when is None:
+            when = datetime.utcnow().isoformat()
+        try:
+            dt_obj = datetime.fromisoformat(when)
+            ts = dt_obj.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            ts = when
+        ts_label = MDLabel(text=ts, halign="right" if align_right else "left", size_hint=(None, None), theme_text_color="Secondary", font_style="Caption")
+        ts_label.texture_update()
+        ts_label.size = (min(max_w, ts_label.texture_size[0]), ts_label.texture_size[1])
+
+        # Compose vertical content inside card
+        content = BoxLayout(orientation="vertical", size_hint=(None, None))
+        content.width = main_label.size[0]
+        content.height = main_label.size[1] + ts_label.size[1] + dp(8)
+        main_label.size_hint = (None, None)
+        ts_label.size_hint = (None, None)
+        content.add_widget(main_label)
+        content.add_widget(ts_label)
+        card.add_widget(content)
+
+        card.size = (content.width + dp(24), content.height + dp(16))
+
+        # Container to align left or right
+        container = BoxLayout(size_hint=(1, None), height=card.height)
         if align_right:
-            # align to right by adding a container
-            container = BoxLayout(size_hint=(1, None), height=card.height)
             container.add_widget(BoxLayout())
             container.add_widget(card)
-            card.add_widget(label)
-            self.chat_box.add_widget(container)
         else:
-            container = BoxLayout(size_hint=(1, None), height=card.height)
             container.add_widget(card)
-            card.add_widget(label)
             container.add_widget(BoxLayout())
-            self.chat_box.add_widget(container)
+        self.chat_box.add_widget(container)
 
         Clock.schedule_once(lambda dt: self.scroll_to_bottom(), 0.05)
 
@@ -141,11 +171,21 @@ class ChatScreen(BoxLayout):
         if not text:
             return
         self.text_input.text = ""
-        self.add_bubble("user", text)
-        self.history.append({"role": "user", "text": text})
+        now = datetime.utcnow().isoformat()
+        self.add_bubble("user", text, now)
+        self.history.append({"role": "user", "text": text, "time": now})
         save_history(self.history)
         # call network in thread
         threading.Thread(target=self.call_gemini, args=(text,), daemon=True).start()
+        # show typing indicator
+        self.set_typing(True)
+
+    def set_typing(self, on: bool):
+        self._is_typing = on
+        if on:
+            self.typing_label.text = "Gemini..."  # localized if needed
+        else:
+            self.typing_label.text = ""
 
     def call_gemini(self, text):
         cfg = load_config()
@@ -153,24 +193,30 @@ class ChatScreen(BoxLayout):
         if not api_key:
             # show settings dialog on main thread
             Clock.schedule_once(lambda dt: self.show_message("مطلوب API key", "يرجى ضبط مفتاح الـ API في الإعدادات."), 0)
+            Clock.schedule_once(lambda dt: self.set_typing(False), 0)
             return
 
         url = API_ENDPOINT_TEMPLATE.format(api_key)
         payload = {"contents": [{"parts": [{"text": text}] }]}
+        reply = ""
         try:
             r = requests.post(url, json=payload, timeout=30)
             r.raise_for_status()
             data = r.json()
             reply = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        except requests.exceptions.RequestException as e:
+            reply = f"خطأ في الشبكة: {e}"
         except Exception as e:
             reply = f"خطأ: {e}"
 
         # schedule UI update
         Clock.schedule_once(partial(self._add_model_reply, reply), 0)
+        Clock.schedule_once(lambda dt: self.set_typing(False), 0)
 
     def _add_model_reply(self, reply, dt):
-        self.add_bubble("model", reply)
-        self.history.append({"role": "model", "text": reply})
+        now = datetime.utcnow().isoformat()
+        self.add_bubble("model", reply, now)
+        self.history.append({"role": "model", "text": reply, "time": now})
         save_history(self.history)
 
     def open_settings(self):
@@ -178,10 +224,11 @@ class ChatScreen(BoxLayout):
         api_val = cfg.get("API_KEY", "")
         self.api_field = MDTextField(hint_text="API Key", text=api_val, size_hint=(1, None), height=dp(48))
         save_btn = MDFlatButton(text="حفظ", on_release=self.save_settings)
+        clear_btn = MDFlatButton(text="حذف المحادثات", on_release=self.clear_history)
         cancel_btn = MDFlatButton(text="إلغاء", on_release=lambda x: self._dialog.dismiss())
         content = BoxLayout(orientation="vertical", spacing=dp(8), padding=dp(8))
         content.add_widget(self.api_field)
-        self._dialog = MDDialog(title="إعدادات", type="custom", content_cls=content, buttons=[save_btn, cancel_btn])
+        self._dialog = MDDialog(title="إعدادات", type="custom", content_cls=content, buttons=[save_btn, clear_btn, cancel_btn])
         self._dialog.open()
 
     def save_settings(self, instance):
@@ -191,6 +238,19 @@ class ChatScreen(BoxLayout):
         if self._dialog:
             self._dialog.dismiss()
         self.show_message("تم الحفظ", "تم حفظ إعدادات الـ API.")
+
+    def clear_history(self, instance):
+        # Confirm before clearing
+        def do_clear(*args):
+            self.history = []
+            save_history(self.history)
+            self.chat_box.clear_widgets()
+            if self._dialog:
+                self._dialog.dismiss()
+            confirm_dlg.dismiss()
+
+        confirm_dlg = MDDialog(title="تأكيد", text="هل تريد حذف كل المحادثات؟", buttons=[MDFlatButton(text="نعم", on_release=do_clear), MDFlatButton(text="لا", on_release=lambda x: confirm_dlg.dismiss())])
+        confirm_dlg.open()
 
     def show_message(self, title, text):
         dlg = MDDialog(title=title, text=text, buttons=[MDFlatButton(text="حسناً", on_release=lambda x: dlg.dismiss())])
